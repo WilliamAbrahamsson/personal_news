@@ -1,15 +1,15 @@
 from flask import Blueprint, jsonify, request, g, current_app
 import os
 import glob
+import re
 import shutil
+import requests
 
 from backend.auth_utils import auth_required
 from backend.extensions import db
 from backend.models.source import Source
 from backend.models.video import Video
 from backend.youtube_captions import extract_video_id
-import re
-import requests
 
 bp = Blueprint("sources", __name__, url_prefix="/sources")
 
@@ -47,21 +47,20 @@ def add_source():
     if not label:
         api_key = os.environ.get("YOUTUBE_API_KEY")
         if api_key:
-            chan_id = None
-            handle = None
             try:
                 u = value
-                # Accept raw handle
+                chan_id = handle = None
+                # Parse possible URL or handle
                 if u.startswith("@"):
                     handle = u[1:]
-                # Extract from URL patterns
                 m = re.search(r"/channel/([A-Za-z0-9_-]+)", u)
                 if m:
                     chan_id = m.group(1)
                 mh = re.search(r"/@([A-Za-z0-9._-]+)", u)
                 if mh:
                     handle = mh.group(1)
-                # Resolve channel title
+
+                # Lookup channel info
                 if chan_id:
                     r = requests.get(
                         "https://www.googleapis.com/youtube/v3/channels",
@@ -71,24 +70,28 @@ def add_source():
                     if r.ok:
                         items = (r.json() or {}).get("items") or []
                         if items:
-                            label = items[0].get("snippet", {}).get("title") or None
+                            label = items[0].get("snippet", {}).get("title")
                 elif handle:
                     r = requests.get(
                         "https://www.googleapis.com/youtube/v3/search",
-                        params={"part": "snippet", "type": "channel", "q": handle, "maxResults": 1, "key": api_key},
+                        params={
+                            "part": "snippet",
+                            "type": "channel",
+                            "q": handle,
+                            "maxResults": 1,
+                            "key": api_key,
+                        },
                         timeout=12,
                     )
                     if r.ok:
                         items = (r.json() or {}).get("items") or []
                         if items:
                             it = items[0]
-                            label = it.get("snippet", {}).get("channelTitle") or it.get("snippet", {}).get("title") or None
-                            # Update value to canonical channel URL when possible
-                            ch_id = it.get("snippet", {}).get("channelId") or None
+                            label = it.get("snippet", {}).get("channelTitle")
+                            ch_id = it.get("snippet", {}).get("channelId")
                             if ch_id:
                                 value = f"https://www.youtube.com/channel/{ch_id}"
             except Exception:
-                # Best-effort only; leave label as None if API fails
                 pass
 
     src = Source(user_id=g.current_user.id, type=type_, value=value, label=label)
@@ -123,14 +126,13 @@ def list_videos(source_id: int):
 @bp.post("/<int:source_id>/videos")
 @auth_required
 def add_video(source_id: int):
-    """Add a new video under a source."""
+    """Add a new video under a source and run AI pipeline."""
     src = Source.query.get(source_id)
     if not src or src.user_id != g.current_user.id:
         return jsonify(error="Source not found"), 404
 
     data = request.get_json() or {}
     url = (data.get("url") or "").strip()
-
     if not url:
         return jsonify(error="'url' is required"), 400
 
@@ -138,14 +140,13 @@ def add_video(source_id: int):
     if existing:
         return jsonify(error="Video already added"), 409
 
-    vid_id = extract_video_id(url)
     # Fetch YouTube metadata
-    title = None
-    channel_title = None
-    description = None
-    views = likes = dislikes = comments = None
-    published_at = None
+    vid_id = extract_video_id(url)
     api_key = os.environ.get("YOUTUBE_API_KEY")
+
+    title = description = channel_title = published_at = None
+    views = likes = dislikes = comments = None
+
     if vid_id and api_key:
         try:
             r = requests.get(
@@ -168,44 +169,45 @@ def add_video(source_id: int):
                     description = sn.get("description")
                     channel_title = sn.get("channelTitle")
                     published_at = sn.get("publishedAt")
+
                     def to_int(x):
                         try:
                             return int(x)
                         except Exception:
                             return None
+
                     views = to_int(st.get("viewCount"))
                     likes = to_int(st.get("likeCount"))
-                    dislikes = to_int(st.get("dislikeCount"))  # may be unavailable
+                    dislikes = to_int(st.get("dislikeCount"))
                     comments = to_int(st.get("commentCount"))
         except Exception:
             pass
 
+    # Create video record
     video = Video(
         source_id=src.id,
         url=url,
         title=title or url,
-        channel_title=channel_title,
         description=description,
+        channel_title=channel_title,
         view_count=views,
         like_count=likes,
         dislike_count=dislikes,
         comment_count=comments,
         published_at=published_at,
     )
-
     db.session.add(video)
     db.session.commit()
-    # Run full pipeline synchronously; respond only when finished
+
+    # ✅ Trigger the AI pipeline asynchronously (new ai.py system)
     try:
-        from backend.pipeline_manager import run_full_pipeline
-        current_app.logger.info("Pipeline run (sync) video_id=%s", video.id)
-        run_full_pipeline(current_app._get_current_object(), video.id, video.url)
+        from backend.routes.ai import _run_async
+        current_app.logger.info("Starting full AI pipeline for video_id=%s", video.id)
+        _run_async(current_app._get_current_object(), video.id, video.url)
     except Exception as e:
-        current_app.logger.exception("Pipeline run failed for video_id=%s: %s", video.id, e)
-        return jsonify(error="Pipeline failed"), 500
-    # Fetch fresh row and return
-    fresh = Video.query.get(video.id)
-    return jsonify(fresh.to_dict()), 201
+        current_app.logger.exception("Pipeline start failed for video_id=%s: %s", video.id, e)
+
+    return jsonify(video.to_dict()), 201
 
 
 # ---------------------------------
@@ -223,112 +225,17 @@ def _get_owned_source_and_video(source_id: int, video_id: int):
 
 
 # ---------------------------------
-# VIDEO OPERATIONS
+# VIDEO DETAILS / UPDATE / DELETE
 # ---------------------------------
 @bp.get("/<int:source_id>/videos/<int:video_id>")
 @auth_required
 def get_video(source_id: int, video_id: int):
-    """Retrieve details for a specific video."""
     src, vid = _get_owned_source_and_video(source_id, video_id)
     if not src:
         return jsonify(error="Source not found"), 404
     if not vid:
         return jsonify(error="Video not found"), 404
     return jsonify(vid.to_dict())
-
-
-# ---------------------------------
-# DOWNLOAD MANAGEMENT
-# ---------------------------------
-
-@bp.post("/<int:source_id>/videos/<int:video_id>/transcribe")
-@auth_required
-def start_video_download(source_id: int, video_id: int):
-    """Start downloading the YouTube video (async). Returns 202 or 200 if already downloaded/in progress."""
-    src, vid = _get_owned_source_and_video(source_id, video_id)
-    if not src:
-        return jsonify(error="Source not found"), 404
-    if not vid:
-        return jsonify(error="Video not found"), 404
-
-    # If already in progress, short-circuit
-    try:
-        from backend.download_manager import get_status, queue_download
-        st = get_status(vid.id)
-        if st.get("status") in ("queued", "starting", "downloading", "processing"):
-            fp = st.get("file_path")
-            if fp:
-                project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-                try:
-                    st["file_path"] = f"/{os.path.relpath(fp, project_root)}"
-                except Exception:
-                    pass
-            return jsonify(message="Download already in progress", **st), 202
-    except Exception:
-        pass
-
-    # If file exists on disk, return finished
-    out_dir = current_app.config.get("VIDEO_DIR")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except Exception:
-        pass
-    vid_key = extract_video_id(vid.url) or str(video_id)
-    existing = sorted(glob.glob(os.path.join(out_dir, f"{vid_key}.*")))
-    if existing:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        rel_path = f"/{os.path.relpath(existing[0], project_root)}"
-        return jsonify(message="Already downloaded", status="finished", progress=100, file_path=rel_path), 200
-
-    # Queue download
-    try:
-        from backend.download_manager import queue_download
-        queue_download(current_app._get_current_object(), vid.id, vid.url)
-    except Exception as e:
-        current_app.logger.exception("Failed to queue download: %s", e)
-        return jsonify(error="Failed to queue download"), 500
-
-    return jsonify(message="Download started", status="starting", progress=0), 202
-
-
-@bp.get("/<int:source_id>/videos/<int:video_id>/download_status")
-@auth_required
-def video_download_status(source_id: int, video_id: int):
-    """Return current download status and progress for the video."""
-    src, vid = _get_owned_source_and_video(source_id, video_id)
-    if not src:
-        return jsonify(error="Source not found"), 404
-    if not vid:
-        return jsonify(error="Video not found"), 404
-
-    try:
-        from backend.download_manager import get_status
-        st = get_status(vid.id)
-    except Exception:
-        st = {"status": "idle", "progress": 0}
-
-    # Map absolute file path to project-relative for clients
-    fp = st.get("file_path")
-    if fp:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        try:
-            st["file_path"] = f"/{os.path.relpath(fp, project_root)}"
-        except Exception:
-            pass
-
-    # If idle/error but file exists, report finished
-    if st.get("status") in (None, "idle") or (st.get("status") == "error" and not st.get("file_path")):
-        out_dir = current_app.config.get("VIDEO_DIR")
-        vid_key = extract_video_id(vid.url) or str(video_id)
-        existing = sorted(glob.glob(os.path.join(out_dir, f"{vid_key}.*")))
-        if existing:
-            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-            rel_path = f"/{os.path.relpath(existing[0], project_root)}"
-            st = {"status": "finished", "progress": 100, "file_path": rel_path}
-    return jsonify(st)
-
-
-## AI endpoints have been moved to /ai blueprint
 
 
 @bp.patch("/<int:source_id>/videos/<int:video_id>")
@@ -345,10 +252,9 @@ def update_video(source_id: int, video_id: int):
     if "title" in data:
         vid.title = (data.get("title") or "").strip() or None
     if "transcribe" in data:
-        transcribe = (data.get("transcribe") or "").strip()
-        vid.transcribe = transcribe
-        # Do not call AI here; summaries are handled via /ai endpoints
-        vid.transcribe_status = "ready" if transcribe else ""
+        text = (data.get("transcribe") or "").strip()
+        vid.transcribe = text
+        vid.transcribe_status = "ready" if text else ""
 
     db.session.commit()
     return jsonify(vid.to_dict())
@@ -357,26 +263,126 @@ def update_video(source_id: int, video_id: int):
 @bp.delete("/<int:source_id>/videos/<int:video_id>")
 @auth_required
 def delete_video(source_id: int, video_id: int):
-    """Delete a video owned by the current user. Best‑effort cleanup of leftover files."""
+    """Delete a video and its local audio if present."""
     src, vid = _get_owned_source_and_video(source_id, video_id)
     if not src:
         return jsonify(error="Source not found"), 404
     if not vid:
         return jsonify(error="Video not found"), 404
 
-    # Attempt to remove any stored audio artifacts if present
     try:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         if getattr(vid, "audio_path", None):
-            p = os.path.join(project_root, vid.audio_path.lstrip("/"))
-            if os.path.isfile(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
+            path = os.path.join(project_root, vid.audio_path.lstrip("/"))
+            if os.path.isfile(path):
+                os.remove(path)
     except Exception:
         pass
 
     db.session.delete(vid)
     db.session.commit()
     return jsonify(message="Video deleted"), 200
+
+
+# ---------------------------------
+# FETCH LATEST VIDEOS
+# ---------------------------------
+# ---------------------------------
+# FETCH LATEST VIDEOS (range-based)
+# ---------------------------------
+@bp.get("/<int:source_id>/fetch_latest")
+@auth_required
+def fetch_latest_videos(source_id: int):
+    """Fetch YouTube videos from index 'from' to 'to' (range-based pagination)."""
+    src = Source.query.get(source_id)
+    if not src or src.user_id != g.current_user.id:
+        return jsonify(error="Source not found"), 404
+
+    if src.type != "youtube_channel":
+        return jsonify(error="Unsupported source type"), 400
+
+    api_key = os.environ.get("YOUTUBE_API_KEY")
+    if not api_key:
+        return jsonify(error="Missing YOUTUBE_API_KEY"), 500
+
+    # Extract channel ID
+    m = re.search(r"/channel/([A-Za-z0-9_-]+)", src.value)
+    chan_id = m.group(1) if m else None
+    if not chan_id:
+        return jsonify(error="Unable to extract channel ID from source"), 400
+
+    # Range parameters
+    from_idx = request.args.get("from", 0, type=int)
+    to_idx = request.args.get("to", 10, type=int)
+    if to_idx <= from_idx:
+        return jsonify(error="'to' must be greater than 'from'"), 400
+
+    # Clamp and calculate
+    max_total = 200  # safety limit
+    from_idx = max(0, min(from_idx, max_total))
+    to_idx = max(from_idx + 1, min(to_idx, max_total))
+    batch_size = to_idx - from_idx
+    max_batch = 50  # YouTube API max per call
+
+    # Compute which "page" of YouTube results to fetch
+    # YouTube API supports 'pageToken', but we can emulate by repeatedly calling until reaching the requested range.
+    all_videos = []
+    next_page = None
+    fetched = 0
+
+    try:
+        while len(all_videos) < to_idx and (fetched < 5):  # avoid too many API calls
+            r = requests.get(
+                "https://www.googleapis.com/youtube/v3/search",
+                params={
+                    "part": "snippet",
+                    "channelId": chan_id,
+                    "order": "date",
+                    "maxResults": min(max_batch, to_idx - len(all_videos)),
+                    "type": "video",
+                    "key": api_key,
+                    **({"pageToken": next_page} if next_page else {}),
+                },
+                timeout=15,
+            )
+            if not r.ok:
+                return jsonify(error=f"YouTube API error: {r.status_code}"), 502
+
+            j = r.json() or {}
+            items = j.get("items", [])
+            next_page = j.get("nextPageToken")
+            fetched += 1
+
+            for it in items:
+                sn = it.get("snippet", {})
+                vid_id = it.get("id", {}).get("videoId")
+                if not vid_id:
+                    continue
+                all_videos.append({
+                    "video_id": vid_id,
+                    "title": sn.get("title"),
+                    "description": sn.get("description"),
+                    "published_at": sn.get("publishedAt"),
+                    "thumbnail": (
+                        sn.get("thumbnails", {}).get("medium", {}).get("url")
+                        or sn.get("thumbnails", {}).get("default", {}).get("url")
+                    ),
+                    "url": f"https://www.youtube.com/watch?v={vid_id}",
+                    "channel_title": sn.get("channelTitle"),
+                })
+
+            if not next_page or len(all_videos) >= to_idx:
+                break
+
+        # Slice requested window
+        videos = all_videos[from_idx:to_idx]
+        return jsonify({
+            "items": videos,
+            "range": {"from": from_idx, "to": to_idx},
+            "total_fetched": len(videos),
+            "has_more": bool(next_page),
+        })
+
+    except Exception as e:
+        current_app.logger.exception("Failed to fetch latest videos: %s", e)
+        return jsonify(error="Failed to fetch latest videos"), 500
